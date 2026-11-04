@@ -10797,6 +10797,7 @@ class ParallelRangeNode(ParallelStatNode):
     nogil = None
     acquire_gil = False
     schedule = None
+    cf_body_names = None
 
     valid_keyword_arguments = ['schedule', 'nogil', 'num_threads', 'chunksize', 'use_threads_if']
 
@@ -11007,10 +11008,7 @@ class ParallelRangeNode(ParallelStatNode):
 
         # The target iteration variable might not be initialized, do it only if
         # we are executing at least 1 iteration, otherwise we should leave the
-        # target unaffected. The target iteration variable is firstprivate to
-        # shut up compiler warnings caused by lastprivate, as the compiler
-        # erroneously believes that nsteps may be <= 0, leaving the private
-        # target index uninitialized
+        # target unaffected.
         code.putln("if (%(nsteps)s > 0)" % fmt_dict)
         code.begin_block()  # if block
         self.generate_loop(code, fmt_dict)
@@ -11052,6 +11050,31 @@ class ParallelRangeNode(ParallelStatNode):
         while isinstance(stat, StatListNode) and stat.stats:
             stat = stat.stats[-1]
         return stat is self
+
+    def can_use_plain_private(self, entry):
+        """
+        firstprivate + lastprivate on one variable makes GCC and clang add a
+        barrier at the start of the loop, so all threads wait for the slowest
+        one to wake up. Avoid the two clauses if nobody can see the difference:
+        all the reads in the loop body only see assignments of the same body,
+        and no read outside of the body sees them.
+        """
+        names = self.cf_body_names
+        if (names is None
+                or not (entry.is_local or entry.is_arg)
+                or entry.in_closure or entry.from_closure
+                or entry.cf_address_taken
+                or not (entry.type.is_numeric or entry.type.is_ptr
+                        or entry.type.is_struct_or_union)):
+            return False
+        for ref in entry.cf_references:
+            state = ref.node.cf_state
+            if ref.node in names:
+                if state.cf_maybe_null or any(a.lhs not in names for a in state):
+                    return False
+            elif any(a.lhs in names for a in state):
+                return False
+        return True
 
     def generate_loop(self, code, fmt_dict):
         if self.is_nested_prange:
@@ -11096,9 +11119,8 @@ class ParallelRangeNode(ParallelStatNode):
             code.put(omp_for)
 
         if self.acquire_gil:
-            # Any firstprivate creates a barrier at least on GCC (and thus
-            # a deadlock if we're using the GIL). So at very least we need
-            # a barrier starting the loop
+            # A variable that is firstprivate and lastprivate creates a barrier
+            # on GCC and clang (and thus a deadlock if we're using the GIL).
             acquire_gil_deadlock_avoidance_point.putln(
                 f"PyThreadState *{Naming.parallel_loop_threadstate} = PyEval_SaveThread();")
 
@@ -11113,7 +11135,11 @@ class ParallelRangeNode(ParallelStatNode):
                     reduction_codepoint.put(
                                 " reduction(%s:%s)" % (op, entry.cname))
             else:
-                if not entry.type.is_pyobject:
+                if entry.type.is_pyobject:
+                    pass
+                elif self.can_use_plain_private(entry):
+                    code.put(" private(%s)" % entry.cname)
+                else:
                     code.put(" firstprivate(%s)" % entry.cname)
                     code.put(" lastprivate(%s)" % entry.cname)
 
