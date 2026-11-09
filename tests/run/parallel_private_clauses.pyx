@@ -3,36 +3,31 @@
 
 # Variables of a prange only need firstprivate + lastprivate, and so the barrier
 # that comes with them on GCC and clang, if the difference can be observed.
+#
+# The doctests check the values: where a variable must keep both clauses, a
+# wrong private leaves the variable at its value from before the loop. The C
+# asserts check that the barrier goes away, and that the clauses stay where a
+# wrong private can't fail reliably: reading an uninitialized value, or a break,
+# where the result may legitimately be the value from before the loop.
 
-# cython: test_assert_c_code_has = private\(__pyx_v_unused_target\)
-# cython: test_assert_c_code_has = private\(__pyx_v_reused_target\)
-# cython: test_assert_c_code_has = private\(__pyx_v_overwritten_target\)
-# cython: test_assert_c_code_has = private\(__pyx_v_body_local\)
-# cython: test_assert_c_code_has = private\(__pyx_v_nested_unused\)
-# cython: test_assert_c_code_has = private\(__pyx_v_struct_whole\)
-# cython: test_fail_if_c_code_has = lastprivate\(__pyx_v_struct_whole\)
-# cython: test_assert_c_code_has = firstprivate\(__pyx_v_struct_partial\)
-# cython: test_assert_c_code_has = lastprivate\(__pyx_v_struct_partial\)
-# cython: test_assert_c_code_has = lastprivate\(__pyx_v_struct_read\)
+# cython: test_assert_c_code_has = \bprivate\(__pyx_v_unused_target\)
+# cython: test_assert_c_code_has = \bprivate\(__pyx_v_reused_target\)
+# cython: test_assert_c_code_has = \bprivate\(__pyx_v_overwritten_target\)
+# cython: test_assert_c_code_has = \bprivate\(__pyx_v_body_local\)
+# cython: test_assert_c_code_has = \bprivate\(__pyx_v_nested_unused\)
+# cython: test_assert_c_code_has = \bprivate\(__pyx_v_struct_whole\)
 # cython: test_fail_if_c_code_has = lastprivate\(__pyx_v_unused_target\)
 # cython: test_fail_if_c_code_has = lastprivate\(__pyx_v_reused_target\)
 # cython: test_fail_if_c_code_has = lastprivate\(__pyx_v_overwritten_target\)
 # cython: test_fail_if_c_code_has = lastprivate\(__pyx_v_body_local\)
 # cython: test_fail_if_c_code_has = lastprivate\(__pyx_v_nested_unused\)
+# cython: test_fail_if_c_code_has = lastprivate\(__pyx_v_struct_whole\)
 
-# cython: test_assert_c_code_has = lastprivate\(__pyx_v_read_target\)
-# cython: test_assert_c_code_has = lastprivate\(__pyx_v_read_local\)
-# cython: test_assert_c_code_has = lastprivate\(__pyx_v_cond_local\)
 # cython: test_assert_c_code_has = firstprivate\(__pyx_v_copied_in\)
 # cython: test_assert_c_code_has = firstprivate\(__pyx_v_maybe_set\)
-# cython: test_assert_c_code_has = lastprivate\(__pyx_v_address_taken\)
-# cython: test_assert_c_code_has = lastprivate\(__pyx_v_else_read\)
-# cython: test_assert_c_code_has = lastprivate\(__pyx_v_break_read\)
+# cython: test_assert_c_code_has = firstprivate\(__pyx_v_struct_partial\)
 # cython: test_assert_c_code_has = lastprivate\(__pyx_v_block_read\)
-# cython: test_assert_c_code_has = lastprivate\(__pyx_v_outer_loop_read\)
-# cython: test_assert_c_code_has = lastprivate\(__pyx_v_locals_read\)
-# cython: test_assert_c_code_has = lastprivate\(__pyx_v_nested_read\)
-# cython: test_assert_c_code_has = lastprivate\(__pyx_v_[0-9a-zA-Z_]*module_target\)
+# cython: test_assert_c_code_has = lastprivate\(__pyx_v_break_read\)
 
 cimport cython.parallel
 from cython.parallel import prange
@@ -152,6 +147,8 @@ def struct_read():
     """
     cdef int i
     cdef pair struct_read
+    struct_read.a = -1
+    struct_read.b = -1
     for i in prange(N, nogil=True, num_threads=4):
         struct_read = make_pair(i)
     return struct_read.a, struct_read.b
@@ -184,11 +181,11 @@ def read_local():
 def cond_local():
     """
     >>> cond_local()
-    7
+    99
     """
     cdef int i, cond_local = 7
     for i in prange(N, nogil=True, num_threads=4):
-        if i < 0:
+        if i % 2:
             cond_local = i
     return cond_local
 
