@@ -232,6 +232,42 @@ def address_taken():
     return ptr[0]
 
 
+def field_address():
+    """A pointer to a field, then the whole struct is assigned in the loop.
+
+    >>> field_address()
+    99
+    """
+    cdef int i
+    cdef pair field_address
+    field_address.a = -1
+    cdef int *ptr = &field_address.a
+    for i in prange(N, nogil=True, num_threads=4):
+        field_address = make_pair(i)
+    return ptr[0]
+
+
+cdef struct with_array:
+    int arr[2]
+
+
+def array_field():
+    """An array field becomes a pointer into the struct without any &.
+
+    >>> array_field()
+    99
+    """
+    cdef int i
+    cdef with_array array_field, tmp
+    array_field.arr[0] = -1
+    cdef int *ptr = array_field.arr
+    for i in prange(N, nogil=True, num_threads=4):
+        tmp.arr[0] = i
+        tmp.arr[1] = i
+        array_field = tmp
+    return ptr[0]
+
+
 def else_read():
     """
     >>> else_read()

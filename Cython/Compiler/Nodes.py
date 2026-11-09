@@ -10777,6 +10777,13 @@ class ParallelWithBlockNode(ParallelStatNode):
         self._parameters_nogil_check(env, ['use_threads_if'], [self.threading_condition])
 
 
+def _has_array_field(type):
+    if not type.is_struct_or_union:
+        return False
+    return any(e.type.is_array or _has_array_field(e.type)
+               for e in type.scope.var_entries)
+
+
 class ParallelRangeNode(ParallelStatNode):
     """
     This node represents a 'for i in cython.parallel.prange():' construct.
@@ -11065,7 +11072,8 @@ class ParallelRangeNode(ParallelStatNode):
                 or entry.in_closure or entry.from_closure
                 or entry.cf_address_taken
                 or not (entry.type.is_numeric or entry.type.is_ptr
-                        or entry.type.is_struct_or_union)):
+                        or entry.type.is_struct_or_union)
+                or _has_array_field(entry.type)):
             return False
         for ref in entry.cf_references:
             state = ref.node.cf_state

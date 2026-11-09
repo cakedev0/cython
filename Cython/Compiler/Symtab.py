@@ -148,7 +148,8 @@ class Entry:
     # error_on_uninitialized      Have Control Flow issue an error when this entry is
     #                             used uninitialized
     # cf_used          boolean    Entry is used
-    # cf_address_taken boolean    The address of the entry is taken with '&'
+    # cf_address_taken boolean    The address of the entry (or of a part of it) is
+    #                             taken with '&' or by a C++ reference argument
     # is_fused_specialized boolean Whether this entry of a cdef or def function
     #                              is a specialization
     # is_cgetter       boolean    Is a c-level getter function
