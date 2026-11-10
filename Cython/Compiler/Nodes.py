@@ -11132,6 +11132,15 @@ class ParallelRangeNode(ParallelStatNode):
             acquire_gil_deadlock_avoidance_point.putln(
                 f"PyThreadState *{Naming.parallel_loop_threadstate} = PyEval_SaveThread();")
 
+        # With the GIL held, lastprivate is written by hand: clang adds a
+        # barrier at the end of a loop with lastprivate, even with nowait, and
+        # it runs before the GIL is released. The thread running the last
+        # iteration saves its values, and writes them back after the explicit
+        # barrier below, once all the threads have read the firstprivate values.
+        # Nested pranges aren't omp'ified, the outermost one does it.
+        manual_lastprivates = []
+        write_back_lastprivates = self.acquire_gil and not self.is_nested_prange
+
         for entry, op in sorted(self.privates.items()):
             # Don't declare the index variable as a reduction
             if op and op in "+*-&^|" and entry != self.target.entry:
@@ -11149,7 +11158,18 @@ class ParallelRangeNode(ParallelStatNode):
                     code.put(" private(%s)" % entry.cname)
                 else:
                     code.put(" firstprivate(%s)" % entry.cname)
-                    code.put(" lastprivate(%s)" % entry.cname)
+                    if write_back_lastprivates:
+                        manual_lastprivates.append(
+                            (entry, Naming.parallel_lastprivate_prefix + entry.cname))
+                    else:
+                        code.put(" lastprivate(%s)" % entry.cname)
+
+        if manual_lastprivates:
+            acquire_gil_deadlock_avoidance_point.putln(
+                f"int {Naming.parallel_loop_is_last} = 0;")
+            for entry, saved_cname in manual_lastprivates:
+                acquire_gil_deadlock_avoidance_point.putln(
+                    f"{entry.type.declaration_code(saved_cname)};")
 
         if self.schedule:
             if self.chunksize:
@@ -11199,6 +11219,17 @@ class ParallelRangeNode(ParallelStatNode):
             guard_around_body_codepoint.putln("if (%s < 2)" % Naming.parallel_why)
 
         code.end_block()  # end guard around loop body
+
+        if manual_lastprivates:
+            # Like lastprivate, even if a break skipped the body.
+            code.putln("#ifdef _OPENMP")
+            code.putln("if (%(i)s == %(nsteps)s - 1) {" % fmt_dict)
+            code.putln(f"{Naming.parallel_loop_is_last} = 1;")
+            for entry, saved_cname in manual_lastprivates:
+                code.putln(f"{saved_cname} = {entry.cname};")
+            code.putln("}")
+            code.putln("#endif")
+
         code.end_block()  # end for loop block
 
         if self.acquire_gil:
@@ -11208,6 +11239,14 @@ class ParallelRangeNode(ParallelStatNode):
             code.putln("}")
             # synchronization point for all loops at the end of the thread but without the GIL
             code.putln("#pragma omp barrier")
+            if manual_lastprivates:
+                code.putln(f"if ({Naming.parallel_loop_is_last}) {{")
+                for entry, saved_cname in manual_lastprivates:
+                    code.putln(f"{entry.cname} = {saved_cname};")
+                code.putln("}")
+                if not (self.is_parallel or self.ends_parallel_block()):
+                    # Code after the loop in the parallel block may read them.
+                    code.putln("#pragma omp barrier")
             code.putln(f"PyEval_RestoreThread({Naming.parallel_loop_threadstate});")
             code.putln("#endif")
 

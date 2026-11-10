@@ -184,6 +184,8 @@ parallel_lineno = pyrex_prefix + "parallel_lineno"
 parallel_clineno = pyrex_prefix + "parallel_clineno"
 parallel_why = pyrex_prefix + "parallel_why"
 parallel_loop_threadstate = pyrex_prefix + "parallel_loop_threadstate"
+parallel_loop_is_last = pyrex_prefix + "parallel_loop_is_last"
+parallel_lastprivate_prefix = pyrex_prefix + "parallel_lastprivate_"
 
 # Python itself used _Py_cs so loosely follow that convention
 critical_section_variable = pyrex_prefix + "cs"
