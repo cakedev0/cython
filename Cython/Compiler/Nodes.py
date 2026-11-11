@@ -11062,19 +11062,41 @@ class ParallelRangeNode(ParallelStatNode):
         A read that only sees assignments of the body sees one of the same
         iteration: otherwise the value from before the loop would reach it in
         the first one. Structs and C++ classes count as assigned where they
-        are declared. An empty state means that only '&x' reaches the read,
-        and reads through that pointer aren't tracked.
+        are declared. Reads through the address of the variable aren't
+        tracked.
         """
         names = self.cf_body_names
-        if names is None or entry.in_closure or entry.from_closure:
+        if (names is None or entry.in_closure or entry.from_closure
+                or entry.cf_address_taken):
             return True
         for ref in entry.cf_references:
             if ref.node in names:
                 state = ref.node.cf_state
-                if (state.cf_maybe_null or not state
-                        or any(a.lhs not in names for a in state)):
+                if state.cf_maybe_null or any(a.lhs not in names for a in state):
                     return True
         return False
+
+    def lastprivate_unobserved(self, entry):
+        """
+        Whether no read outside of the loop body can see the value that
+        lastprivate leaves, so plain private does. clang adds a barrier at the
+        end of a loop with lastprivate, even with nowait. Only local numbers
+        and pointers whose address is never taken: nothing else can reach
+        them. Structs could be reached through a pointer to a field.
+        """
+        names = self.cf_body_names
+        if (names is None
+                or not (entry.is_local or entry.is_arg)
+                or entry.in_closure or entry.from_closure
+                or entry.cf_address_taken
+                or not (entry.type.is_numeric or entry.type.is_ptr)):
+            return False
+        for ref in entry.cf_references:
+            if ref.node not in names:
+                state = ref.node.cf_state
+                if any(a.lhs in names for a in state):
+                    return False
+        return True
 
     def generate_loop(self, code, fmt_dict):
         if self.is_nested_prange:
@@ -11132,9 +11154,14 @@ class ParallelRangeNode(ParallelStatNode):
                     reduction_codepoint.put(
                                 " reduction(%s:%s)" % (op, entry.cname))
             else:
-                if not entry.type.is_pyobject:
-                    if self.body_may_read_value_from_before(entry):
-                        code.put(" firstprivate(%s)" % entry.cname)
+                if entry.type.is_pyobject:
+                    pass
+                elif self.body_may_read_value_from_before(entry):
+                    code.put(" firstprivate(%s)" % entry.cname)
+                    code.put(" lastprivate(%s)" % entry.cname)
+                elif self.lastprivate_unobserved(entry):
+                    code.put(" private(%s)" % entry.cname)
+                else:
                     code.put(" lastprivate(%s)" % entry.cname)
 
         if self.schedule:

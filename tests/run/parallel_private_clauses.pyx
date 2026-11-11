@@ -2,10 +2,11 @@
 # tag: openmp, threads
 
 # A variable assigned in a prange is firstprivate only when a read in the loop
-# body may see its value from before the loop. A variable in both firstprivate
-# and lastprivate makes GCC and clang add a barrier at the start of the loop.
-# The doctests check the values where firstprivate is needed, and the C code
-# checks that it's left out elsewhere.
+# body may see its value from before the loop, and lastprivate only when a read
+# after the loop may see its value from the loop. A variable in both makes GCC
+# and clang add a barrier at the start of the loop, and clang adds one at its
+# end for lastprivate. The doctests check the values where a clause is needed,
+# and the C code checks that it's left out elsewhere.
 
 # cython: test_fail_if_c_code_has = firstprivate\(__pyx_v_target\)
 # cython: test_fail_if_c_code_has = firstprivate\(__pyx_v_body_local\)
@@ -15,6 +16,15 @@
 # cython: test_fail_if_c_code_has = firstprivate\(__pyx_v_read_after\)
 # cython: test_assert_c_code_has = firstprivate\(__pyx_v_copied_in\)
 # cython: test_assert_c_code_has = firstprivate\(__pyx_v_previous_iteration\)
+
+# cython: test_assert_c_code_has = private\(__pyx_v_body_local\)
+# cython: test_fail_if_c_code_has = lastprivate\(__pyx_v_body_local\)
+# cython: test_fail_if_c_code_has = lastprivate\(__pyx_v_nested_local\)
+# cython: test_fail_if_c_code_has = lastprivate\(__pyx_v_reused_target\)
+# cython: test_assert_c_code_has = lastprivate\(__pyx_v_target\)
+# cython: test_assert_c_code_has = lastprivate\(__pyx_v_read_after\)
+# cython: test_assert_c_code_has = lastprivate\(__pyx_v_struct_assigned\)
+# cython: test_assert_c_code_has = lastprivate\(__pyx_v_address_before\)
 
 cimport cython
 from cython.parallel import prange, parallel
@@ -56,6 +66,20 @@ def nested_local():
         for j in range(10):
             nested_local = i
             total += nested_local
+    return total
+
+
+def reused_target():
+    """Each loop assigns the target before reading it.
+
+    >>> reused_target()
+    9900
+    """
+    cdef int reused_target, total = 0
+    for reused_target in prange(N, nogil=True, num_threads=4):
+        total += reused_target
+    for reused_target in prange(N, nogil=True, num_threads=4):
+        total += reused_target
     return total
 
 
@@ -220,3 +244,72 @@ def read_in_block_before_loop():
             if i < 0:
                 x = 0
     return n_wrong
+
+
+# A read after the loop may see its value: lastprivate stays.
+
+
+def address_before():
+    """
+    >>> address_before()
+    99
+    """
+    cdef int i, address_before = -1
+    cdef int *p = &address_before
+    for i in prange(N, nogil=True, num_threads=4):
+        address_before = i
+    return p[0]
+
+
+def else_read():
+    """
+    >>> else_read()
+    99
+    """
+    cdef int i, x = -1, result = -2
+    for i in prange(N, nogil=True, num_threads=4):
+        x = i
+    else:
+        result = x
+    return result
+
+
+def outer_loop_read():
+    """The next iteration of the outer loop reads the value of the prange.
+
+    >>> outer_loop_read()
+    (-1, 99)
+    """
+    cdef int i, k, x = -1
+    cdef int seen[2]
+    for k in range(2):
+        seen[k] = x
+        for i in prange(N, nogil=True, num_threads=4):
+            x = i
+    return seen[0], seen[1]
+
+
+def locals_read():
+    """
+    >>> locals_read()
+    99
+    """
+    cdef int i, x = -1
+    for i in prange(N, nogil=True, num_threads=4):
+        x = i
+    return locals()['x']
+
+
+def struct_read_after():
+    """Structs keep lastprivate: a pointer to a field could read them.
+
+    >>> struct_read_after()
+    99
+    """
+    cdef int i
+    cdef pair s
+    s.b = -1
+    cdef int *p = &s.b
+    for i in prange(N, nogil=True, num_threads=4):
+        s = make_pair(i)
+    return p[0]

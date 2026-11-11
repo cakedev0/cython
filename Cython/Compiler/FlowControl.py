@@ -1546,6 +1546,9 @@ class ControlFlowAnalysis(CythonTransform):
         if node.operand.is_name:
             # Fake assignment to silence warning
             self.mark_assignment(node.operand, fake_rhs_expr)
+            entry = node.operand.entry or self.env.lookup(node.operand.name)
+            if entry:
+                entry.cf_address_taken = True
         self.visitchildren(node)
         return node
 
