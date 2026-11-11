@@ -394,6 +394,23 @@ def read_before_loop():
     return x, n_wrong
 
 
+def else_ends_block():
+    """The else clause of the last loop of the block sees the last value.
+
+    >>> else_ends_block()
+    (99, 0)
+    """
+    cdef int i, x = -1, n_wrong = 0
+    cdef int *n_wrong_ptr = &n_wrong
+    with nogil, parallel(num_threads=4):
+        for i in prange(N):
+            x = i
+        else:
+            if x != N - 1:
+                n_wrong_ptr[0] = 1
+    return x, n_wrong
+
+
 def two_loops():
     """The second loop copies in the last value of the first one.
 
