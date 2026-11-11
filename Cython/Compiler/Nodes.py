@@ -10797,6 +10797,7 @@ class ParallelRangeNode(ParallelStatNode):
     nogil = None
     acquire_gil = False
     schedule = None
+    cf_body_names = None
 
     valid_keyword_arguments = ['schedule', 'nogil', 'num_threads', 'chunksize', 'use_threads_if']
 
@@ -11007,10 +11008,7 @@ class ParallelRangeNode(ParallelStatNode):
 
         # The target iteration variable might not be initialized, do it only if
         # we are executing at least 1 iteration, otherwise we should leave the
-        # target unaffected. The target iteration variable is firstprivate to
-        # shut up compiler warnings caused by lastprivate, as the compiler
-        # erroneously believes that nsteps may be <= 0, leaving the private
-        # target index uninitialized
+        # target unaffected.
         code.putln("if (%(nsteps)s > 0)" % fmt_dict)
         code.begin_block()  # if block
         self.generate_loop(code, fmt_dict)
@@ -11053,6 +11051,30 @@ class ParallelRangeNode(ParallelStatNode):
             stat = stat.stats[-1]
         # The else clause runs after the loop and may read its variables.
         return stat is self and not self.else_clause
+
+    def body_may_read_value_from_before(self, entry):
+        """
+        Whether a read in the loop body may see a value assigned before the
+        loop, which needs firstprivate. A variable in both firstprivate and
+        lastprivate makes GCC and clang add a barrier at the start of the
+        loop, so all threads wait for the slowest one to start.
+
+        A read that only sees assignments of the body sees one of the same
+        iteration: otherwise the value from before the loop would reach it in
+        the first one. Structs and C++ classes count as assigned where they
+        are declared. An empty state means that only '&x' reaches the read,
+        and reads through that pointer aren't tracked.
+        """
+        names = self.cf_body_names
+        if names is None or entry.in_closure or entry.from_closure:
+            return True
+        for ref in entry.cf_references:
+            if ref.node in names:
+                state = ref.node.cf_state
+                if (state.cf_maybe_null or not state
+                        or any(a.lhs not in names for a in state)):
+                    return True
+        return False
 
     def generate_loop(self, code, fmt_dict):
         if self.is_nested_prange:
@@ -11111,7 +11133,8 @@ class ParallelRangeNode(ParallelStatNode):
                                 " reduction(%s:%s)" % (op, entry.cname))
             else:
                 if not entry.type.is_pyobject:
-                    code.put(" firstprivate(%s)" % entry.cname)
+                    if self.body_may_read_value_from_before(entry):
+                        code.put(" firstprivate(%s)" % entry.cname)
                     code.put(" lastprivate(%s)" % entry.cname)
 
         if self.schedule:

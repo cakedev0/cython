@@ -704,6 +704,18 @@ def check_definitions(flow: ControlFlow, compiler_directives: dict):
         node.cf_state = ControlFlowState(node.cf_state)
 
 
+class NameNodeCollector(TreeVisitor):
+    def __init__(self):
+        super().__init__()
+        self.names = set()
+
+    def visit_NameNode(self, node):
+        self.names.add(node)
+
+    def visit_Node(self, node):
+        self.visitchildren(node)
+
+
 class AssignmentCollector(TreeVisitor):
     def __init__(self):
         super().__init__()
@@ -1249,6 +1261,11 @@ class ControlFlowAnalysis(CythonTransform):
                     self.reductions.add(private_node.entry)
 
             node = self.visit_ForInStatNode(node)
+
+            collector = NameNodeCollector()
+            collector.visit(node.body)
+            collector.names.add(node.target)
+            node.cf_body_names = collector.names
 
         self.reductions = reductions
         return node
