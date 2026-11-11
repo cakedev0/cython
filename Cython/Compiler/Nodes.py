@@ -10828,6 +10828,26 @@ class ParallelWithBlockNode(ParallelStatNode):
         self._parameters_nogil_check(env, ['use_threads_if'], [self.threading_condition])
 
 
+def _is_plain_c_type(type, allow_arrays, in_cpp):
+    """
+    A number, a pointer, or a C struct or union made only of those (and of
+    arrays of those if allow_arrays), which memcpy and assignment copy fully.
+    In C++, an extern struct may declare only some of its fields, and the
+    others may be C++ classes.
+    """
+    if type.is_numeric or type.is_ptr:
+        return True
+    if type.is_array:
+        return allow_arrays and _is_plain_c_type(type.base_type, allow_arrays, in_cpp)
+    if type.is_struct_or_union and not type.is_cpp_class:
+        type_entry = getattr(type, 'entry', None)
+        if in_cpp and (type_entry is None or type_entry.visibility == 'extern'):
+            return False
+        return all(_is_plain_c_type(e.type, allow_arrays, in_cpp)
+                   for e in type.scope.var_entries)
+    return False
+
+
 parallel_snapshot_utility_code = UtilityCode(
     proto="""
 /* A prange copies its variables in whether they were assigned or not. Going
@@ -11140,9 +11160,16 @@ class ParallelRangeNode(ParallelStatNode):
     def vars_copied_by_hand(self, in_block):
         """
         The privates of this prange that are copied in and out by hand instead
-        of with firstprivate + lastprivate (see generate_loop). In a parallel
-        block, closure variables keep the clauses: their cname changes while
-        the prange runs.
+        of with firstprivate + lastprivate (see generate_loop). Only plain C
+        types: the copies are memcpy and plain assignments, which C++ classes
+        (also as struct members) don't survive.
+
+        In a parallel block, the variable is private to the whole block, so
+        code after the loop in the block must not reach the original variable
+        another way: only locals and arguments outside of closures whose
+        address is never taken, and no struct with an array field, which gives
+        a pointer into it without "&". Closure variables would also change
+        cname while the prange runs. Other variables keep the clauses.
         """
         if self.is_nested_prange:
             return []
@@ -11150,10 +11177,13 @@ class ParallelRangeNode(ParallelStatNode):
         for entry, op in sorted(self.privates.items()):
             if op and op in "+*-&^|" and entry != self.target.entry:
                 continue  # reduction
-            if not (entry.type.is_numeric or entry.type.is_ptr
-                    or entry.type.is_struct_or_union):
+            if not _is_plain_c_type(entry.type, allow_arrays=not in_block,
+                                    in_cpp=entry.scope.is_cpp()):
                 continue
-            if in_block and (entry.in_closure or entry.from_closure):
+            if in_block and not (
+                    (entry.is_local or entry.is_arg)
+                    and not (entry.in_closure or entry.from_closure)
+                    and not entry.cf_address_taken):
                 continue
             result.append(entry)
         return result
@@ -11169,10 +11199,10 @@ class ParallelRangeNode(ParallelStatNode):
         # back after the region. The copy-in and the copy-out then touch
         # different variables, and no clause is left to add a barrier.
         #
-        # With a static schedule (also the default of GCC, clang and MSVC),
-        # each thread runs its iterations in increasing order. So a thread ran
-        # the last iteration if the last one it ran is the last, and it can
-        # copy out after its loop, which keeps the loop vectorizable. Other
+        # With a static schedule (made explicit if none is given), each thread
+        # runs its iterations in increasing order. So a thread ran the last
+        # iteration if the last one it ran is the last, and it can copy out
+        # after its loop, which keeps the loop vectorizable. Other
         # schedules may run chunks out of order, so they check every iteration.
         #
         # In a parallel block, there's no single-threaded point before the
@@ -11180,6 +11210,9 @@ class ParallelRangeNode(ParallelStatNode):
         # block, set from the snapshot when each thread starts (see
         # ParallelWithBlockNode), and the loop needs no clause. After the loop
         # (and a barrier if code follows), each thread takes the copied-out value.
+        # The original variable is only set when the block ends, so variables
+        # that a pointer or another function can reach keep the clauses (see
+        # vars_copied_by_hand).
         snapshots = {}
         copy_outs = {}
         copy_out_after_loop = self.schedule in (None, 'static')
@@ -11280,6 +11313,11 @@ class ParallelRangeNode(ParallelStatNode):
                 chunksize = ""
 
             code.put(" schedule(%s%s)" % (self.schedule, chunksize))
+        elif copy_outs and copy_out_after_loop:
+            # Without a schedule clause, the schedule is up to the compiler.
+            # Only an explicit static schedule guarantees that each thread
+            # runs its iterations in increasing order.
+            code.put(" schedule(static)")
 
         self.put_num_threads(reduction_codepoint)
 
