@@ -10727,6 +10727,31 @@ class ParallelWithBlockNode(ParallelStatNode):
         self.declare_closure_privates(code)
         self.setup_parallel_control_flow_block(code)
 
+        # Variables of the pranges directly in this block that are copied by
+        # hand (see ParallelRangeNode.generate_loop): private to the block and
+        # set from a snapshot when each thread starts. A loop copies its last
+        # value out to one of two slots, then each thread reads it after the
+        # barrier. The next loop uses the other slot: a slow thread may still be
+        # reading this one. The one after can reuse it, after another barrier.
+        # Every thread meets the loops in the same order, so a private parity
+        # picks the slot. "final" takes each copied-out value too, and sets the
+        # variable back after the region. The temps are allocated before
+        # collecting the temps to privatize: they're shared.
+        self.copied_vars = {}
+        if self.parent is None:
+            for prange in self.direct_pranges():
+                for entry in prange.vars_copied_by_hand(in_block=True):
+                    if entry in self.copied_vars:
+                        continue
+                    code.globalstate.use_utility_code(parallel_snapshot_utility_code)
+                    snapshot, final, slot0, slot1 = [
+                        code.funcstate.allocate_temp(entry.type, manage_ref=False)
+                        for _ in range(4)]
+                    for temp in (snapshot, final):
+                        code.putln("__Pyx_ParallelSnapshot(&%s, &%s, sizeof(%s));" % (
+                            temp, entry.cname, temp))
+                    self.copied_vars[entry] = (snapshot, final, slot0, slot1)
+
         code.putln("#ifdef _OPENMP")
         code.put("#pragma omp parallel ")
 
@@ -10740,6 +10765,8 @@ class ParallelWithBlockNode(ParallelStatNode):
             if privates:
                 joined_privates = ', '.join(sorted(privates))
                 code.put(f'firstprivate({joined_privates})')
+        if self.copied_vars:
+            code.put(" private(%s)" % ', '.join(sorted(e.cname for e in self.copied_vars)))
 
         self.privatization_insertion_point = code.insertion_point()
         self.put_num_threads(code)
@@ -10748,13 +10775,23 @@ class ParallelWithBlockNode(ParallelStatNode):
         code.putln("#endif /* _OPENMP */")
 
         code.begin_block()  # parallel block
+        if self.copied_vars:
+            code.putln("int %s = 0;" % Naming.parallel_slot_parity)
         self.begin_parallel_block(code)
+        for entry, temps in self.copied_vars.items():
+            code.putln("%s = %s;" % (entry.cname, temps[0]))
         code.funcstate.start_collecting_temps()
         self.body.generate_execution_code(code)
         self.trap_parallel_exit(code)
         self.privatize_temps(code)
         self.end_parallel_block(code)
         code.end_block()  # end parallel block
+
+        for entry, temps in self.copied_vars.items():
+            code.putln("%s = %s;" % (entry.cname, temps[1]))
+        for temps in self.copied_vars.values():
+            for temp in temps:
+                code.funcstate.release_temp(temp)
 
         continue_ = code.label_used(code.continue_label)
         break_ = code.label_used(code.break_label)
@@ -10773,8 +10810,62 @@ class ParallelWithBlockNode(ParallelStatNode):
 
         self.release_closure_privates(code)
 
+    def direct_pranges(self):
+        """The pranges whose enclosing parallel construct is this block."""
+        found = []
+        def visit(node):
+            for attr in node.child_attrs or ():
+                child = getattr(node, attr, None)
+                for c in (child if isinstance(child, list) else [child]):
+                    if isinstance(c, Node):
+                        if isinstance(c, ParallelRangeNode) and c.parent is self:
+                            found.append(c)
+                        visit(c)
+        visit(self.body)
+        return found
+
     def nogil_check(self, env):
         self._parameters_nogil_check(env, ['use_threads_if'], [self.threading_condition])
+
+
+def _is_plain_c_type(type, allow_arrays, in_cpp):
+    """
+    A number, a pointer, or a C struct or union made only of those (and of
+    arrays of those if allow_arrays), which memcpy and assignment copy fully.
+    In C++, an extern struct may declare only some of its fields, and the
+    others may be C++ classes.
+    """
+    if type.is_numeric or type.is_ptr:
+        return True
+    if type.is_array:
+        return allow_arrays and _is_plain_c_type(type.base_type, allow_arrays, in_cpp)
+    if type.is_struct_or_union and not type.is_cpp_class:
+        type_entry = getattr(type, 'entry', None)
+        if in_cpp and (type_entry is None or type_entry.visibility == 'extern'):
+            return False
+        return all(_is_plain_c_type(e.type, allow_arrays, in_cpp)
+                   for e in type.scope.var_entries)
+    return False
+
+
+parallel_snapshot_utility_code = UtilityCode(
+    proto="""
+/* A prange copies its variables in whether they were assigned or not. Going
+   through a pointer that isn't const avoids clang's "uninitialized" warning,
+   and the pragma avoids GCC's, which GCC gives after inlining. */
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
+#pragma GCC diagnostic ignored "-Wuninitialized"
+#endif
+static CYTHON_INLINE void __Pyx_ParallelSnapshot(void *dst, void *src, size_t size) {
+    memcpy(dst, src, size);
+}
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
+""",
+    requires=[UtilityCode.load_cached("IncludeStringH", "StringTools.c")])
 
 
 class ParallelRangeNode(ParallelStatNode):
@@ -11054,7 +11145,95 @@ class ParallelRangeNode(ParallelStatNode):
             stat = stat.stats[-1]
         return stat is self
 
+    def put_copy_outs(self, code, copy_outs, block_vars):
+        code.begin_block()
+        for entry, temp in copy_outs.items():
+            if block_vars:
+                _, final, slot0, slot1 = temp
+                code.putln("if (%s) %s = %s; else %s = %s;" % (
+                    Naming.parallel_slot_parity, slot1, entry.cname, slot0, entry.cname))
+                code.putln("%s = %s;" % (final, entry.cname))
+            else:
+                code.putln("%s = %s;" % (temp, entry.cname))
+        code.end_block()
+
+    def vars_copied_by_hand(self, in_block):
+        """
+        The privates of this prange that are copied in and out by hand instead
+        of with firstprivate + lastprivate (see generate_loop). Only plain C
+        types: the copies are memcpy and plain assignments, which C++ classes
+        (also as struct members) don't survive.
+
+        In a parallel block, the variable is private to the whole block, so
+        code after the loop in the block must not reach the original variable
+        another way: only locals and arguments outside of closures whose
+        address is never taken, and no struct with an array field, which gives
+        a pointer into it without "&". Closure variables would also change
+        cname while the prange runs. Other variables keep the clauses.
+        """
+        if self.is_nested_prange:
+            return []
+        result = []
+        for entry, op in sorted(self.privates.items()):
+            if op and op in "+*-&^|" and entry != self.target.entry:
+                continue  # reduction
+            if not _is_plain_c_type(entry.type, allow_arrays=not in_block,
+                                    in_cpp=entry.scope.is_cpp()):
+                continue
+            if in_block and not (
+                    (entry.is_local or entry.is_arg)
+                    and not (entry.in_closure or entry.from_closure)
+                    and not entry.cf_address_taken):
+                continue
+            result.append(entry)
+        return result
+
     def generate_loop(self, code, fmt_dict):
+        # A variable in both firstprivate and lastprivate makes GCC and clang
+        # add a barrier at the start of the loop: no thread may copy the last
+        # value out before every thread has copied the first one in. Clang also
+        # adds one at the end for lastprivate. For a "parallel for", make the
+        # variable private to the parallel region and copy it by hand: in from
+        # a snapshot taken before the region, when each thread starts, and out
+        # to a temp that the thread running the last iteration sets, copied
+        # back after the region. The copy-in and the copy-out then touch
+        # different variables, and no clause is left to add a barrier.
+        #
+        # With a static schedule (made explicit if none is given), each thread
+        # runs its iterations in increasing order. So a thread ran the last
+        # iteration if the last one it ran is the last, and it can copy out
+        # after its loop, which keeps the loop vectorizable. Other
+        # schedules may run chunks out of order, so they check every iteration.
+        #
+        # In a parallel block, there's no single-threaded point before the
+        # loop, so the block does the copy-in: the variable is private to the
+        # block, set from the snapshot when each thread starts (see
+        # ParallelWithBlockNode), and the loop needs no clause. After the loop
+        # (and a barrier if code follows), each thread takes the copied-out value.
+        # The original variable is only set when the block ends, so variables
+        # that a pointer or another function can reach keep the clauses (see
+        # vars_copied_by_hand).
+        snapshots = {}
+        copy_outs = {}
+        copy_out_after_loop = self.schedule in (None, 'static')
+        block_vars = {}
+        if not self.is_parallel and not self.is_nested_prange:
+            block_vars = getattr(self.parent, 'copied_vars', None) or {}
+            for entry in self.privates:
+                if entry in block_vars:
+                    copy_outs[entry] = block_vars[entry]
+            if copy_outs and copy_out_after_loop:
+                code.putln("%s %s = -1;" % (
+                    self.index_type.empty_declaration_code(), Naming.parallel_last_index))
+        if self.is_parallel and not self.is_nested_prange:
+            for entry in self.vars_copied_by_hand(in_block=False):
+                temp = code.funcstate.allocate_temp(entry.type, manage_ref=False)
+                code.globalstate.use_utility_code(parallel_snapshot_utility_code)
+                code.putln("__Pyx_ParallelSnapshot(&%s, &%s, sizeof(%s));" % (
+                    temp, entry.cname, temp))
+                snapshots[entry] = temp
+                copy_outs[entry] = code.funcstate.allocate_temp(entry.type, manage_ref=False)
+
         if self.is_nested_prange:
             code.putln("#if 0")
         else:
@@ -11080,8 +11259,15 @@ class ParallelRangeNode(ParallelStatNode):
 
             code.begin_block()  # pragma omp parallel begin block
 
+            if copy_outs and copy_out_after_loop:
+                code.putln("%s %s = -1;" % (
+                    self.index_type.empty_declaration_code(), Naming.parallel_last_index))
+
             # Initialize the GIL if needed for this thread
             self.begin_parallel_block(code)
+
+            for entry, temp in snapshots.items():
+                code.putln("%s = %s;" % (entry.cname, temp))
 
             if self.is_nested_prange:
                 code.putln("#if 0")
@@ -11109,6 +11295,12 @@ class ParallelRangeNode(ParallelStatNode):
                     # This is the only way reductions + nesting works in gcc4.5
                     reduction_codepoint.put(
                                 " reduction(%s:%s)" % (op, entry.cname))
+            elif entry in snapshots:
+                reduction_codepoint.put(" private(%s)" % entry.cname)
+            elif entry in copy_outs:
+                pass  # private to the parallel block
+            elif self.is_nested_prange:
+                pass  # not parallelized, its pragma is in "#if 0"
             else:
                 if not entry.type.is_pyobject:
                     code.put(" firstprivate(%s)" % entry.cname)
@@ -11121,6 +11313,11 @@ class ParallelRangeNode(ParallelStatNode):
                 chunksize = ""
 
             code.put(" schedule(%s%s)" % (self.schedule, chunksize))
+        elif copy_outs and copy_out_after_loop:
+            # Without a schedule clause, the schedule is up to the compiler.
+            # Only an explicit static schedule guarantees that each thread
+            # runs its iterations in increasing order.
+            code.put(" schedule(static)")
 
         self.put_num_threads(reduction_codepoint)
 
@@ -11162,8 +11359,20 @@ class ParallelRangeNode(ParallelStatNode):
             guard_around_body_codepoint.putln("if (%s < 2)" % Naming.parallel_why)
 
         code.end_block()  # end guard around loop body
+
+        if copy_outs and copy_out_after_loop:
+            code.putln("%s = %s;" % (Naming.parallel_last_index, fmt_dict['i']))
+        elif copy_outs:
+            code.putln("if (%s == %s - 1)" % (fmt_dict['i'], fmt_dict['nsteps']))
+            self.put_copy_outs(code, copy_outs, block_vars)
+
         code.end_block()  # end for loop block
 
+        if copy_outs and copy_out_after_loop:
+            code.putln("if (%s == %s - 1)" % (Naming.parallel_last_index, fmt_dict['nsteps']))
+            self.put_copy_outs(code, copy_outs, block_vars)
+
+        barrier = self.acquire_gil
         if self.acquire_gil:
             code.putln("#ifdef _OPENMP")
             code.putln(f"if (!{Naming.parallel_loop_threadstate}) {{")
@@ -11181,11 +11390,28 @@ class ParallelRangeNode(ParallelStatNode):
             code.putln("#ifdef _OPENMP")
             code.putln("#pragma omp barrier")
             code.putln("#endif")
+            barrier = True
+
+        if block_vars and copy_outs:
+            if barrier:
+                # After the barrier, all threads take the value of the last
+                # iteration. If the block ends here, it copies the value back
+                # after the region.
+                for entry, temps in copy_outs.items():
+                    code.putln("%s = %s ? %s : %s;" % (
+                        entry.cname, Naming.parallel_slot_parity, temps[3], temps[2]))
+            code.putln("%s = !%s;" % (Naming.parallel_slot_parity, Naming.parallel_slot_parity))
 
         if self.is_parallel:
             # Release the GIL and deallocate the thread state
             self.end_parallel_block(code)
             code.end_block()  # pragma omp parallel end block
+
+        if snapshots:
+            for entry, temp in copy_outs.items():
+                code.putln("%s = %s;" % (entry.cname, temp))
+            for temp in list(snapshots.values()) + list(copy_outs.values()):
+                code.funcstate.release_temp(temp)
 
 
 class CnameDecoratorNode(StatNode):
