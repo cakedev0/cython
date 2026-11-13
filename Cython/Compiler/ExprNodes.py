@@ -6630,6 +6630,9 @@ class SimpleCallNode(CallNode):
         for i in range(min(max_nargs, actual_nargs)):
             formal_arg = func_type.args[i]
             formal_type = formal_arg.type
+            if ((formal_type.is_reference or formal_type.is_rvalue_reference)
+                    and args[i].is_name and args[i].entry):
+                args[i].entry.cf_address_taken = True
             arg = args[i].coerce_to(formal_type, env)
             if formal_arg.not_none:
                 # C methods must do the None checks at *call* time

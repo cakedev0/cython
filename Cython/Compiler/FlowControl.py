@@ -704,6 +704,18 @@ def check_definitions(flow: ControlFlow, compiler_directives: dict):
         node.cf_state = ControlFlowState(node.cf_state)
 
 
+class NameNodeCollector(TreeVisitor):
+    def __init__(self):
+        super().__init__()
+        self.names = set()
+
+    def visit_NameNode(self, node):
+        self.names.add(node)
+
+    def visit_Node(self, node):
+        self.visitchildren(node)
+
+
 class AssignmentCollector(TreeVisitor):
     def __init__(self):
         super().__init__()
@@ -1250,6 +1262,11 @@ class ControlFlowAnalysis(CythonTransform):
 
             node = self.visit_ForInStatNode(node)
 
+            collector = NameNodeCollector()
+            collector.visit(node.body)
+            collector.names.add(node.target)
+            node.cf_body_names = collector.names
+
         self.reductions = reductions
         return node
 
@@ -1529,6 +1546,14 @@ class ControlFlowAnalysis(CythonTransform):
         if node.operand.is_name:
             # Fake assignment to silence warning
             self.mark_assignment(node.operand, fake_rhs_expr)
+        # Also &s.a or &s.arr[0], which point into s.
+        base = node.operand
+        while base.is_attribute or base.is_subscript:
+            base = base.obj if base.is_attribute else base.base
+        if base.is_name:
+            entry = base.entry or self.env.lookup(base.name)
+            if entry:
+                entry.cf_address_taken = True
         self.visitchildren(node)
         return node
 
