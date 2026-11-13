@@ -10777,6 +10777,44 @@ class ParallelWithBlockNode(ParallelStatNode):
         self._parameters_nogil_check(env, ['use_threads_if'], [self.threading_condition])
 
 
+def _is_plain_c_type(type, in_cpp):
+    """
+    A number, a pointer, or a C struct, union or array made only of those,
+    which memcpy and assignment copy fully. In C++, an extern struct may
+    declare only some of its fields, and the others may be C++ classes.
+    """
+    if type.is_numeric or type.is_ptr:
+        return True
+    if type.is_array:
+        return _is_plain_c_type(type.base_type, in_cpp)
+    if type.is_struct_or_union and not type.is_cpp_class:
+        type_entry = getattr(type, 'entry', None)
+        if in_cpp and (type_entry is None or type_entry.visibility == 'extern'):
+            return False
+        return all(_is_plain_c_type(e.type, in_cpp) for e in type.scope.var_entries)
+    return False
+
+
+parallel_snapshot_utility_code = UtilityCode(
+    proto="""
+/* A prange copies its variables in whether they were assigned or not. Going
+   through a pointer that isn't const avoids clang's "uninitialized" warning,
+   and the pragma avoids GCC's, which GCC gives after inlining. */
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
+#pragma GCC diagnostic ignored "-Wuninitialized"
+#endif
+static CYTHON_INLINE void __Pyx_ParallelSnapshot(void *dst, void *src, size_t size) {
+    memcpy(dst, src, size);
+}
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
+""",
+    requires=[UtilityCode.load_cached("IncludeStringH", "StringTools.c")])
+
+
 class ParallelRangeNode(ParallelStatNode):
     """
     This node represents a 'for i in cython.parallel.prange():' construct.
@@ -11054,7 +11092,58 @@ class ParallelRangeNode(ParallelStatNode):
             stat = stat.stats[-1]
         return stat is self
 
+    def vars_copied_by_hand(self):
+        """
+        The privates of a "parallel for" that are copied in and out by hand
+        instead of with firstprivate + lastprivate (see generate_loop). Only
+        plain C types: the copies are memcpy and plain assignments, which C++
+        classes (also as struct members) don't survive.
+        """
+        if not self.is_parallel or self.is_nested_prange:
+            return []
+        return [
+            entry for entry, op in sorted(self.privates.items())
+            if not (op and op in "+*-&^|" and entry != self.target.entry)
+            and _is_plain_c_type(entry.type, entry.scope.is_cpp())
+        ]
+
+    def put_copy_outs(self, code, copy_outs):
+        code.begin_block()
+        for entry, temp in copy_outs.items():
+            code.putln("%s = %s;" % (temp, entry.cname))
+        code.end_block()
+
     def generate_loop(self, code, fmt_dict):
+        # A variable in both firstprivate and lastprivate makes GCC and clang
+        # add a barrier at the start of the loop: no thread may copy the last
+        # value out before every thread has copied the first one in. Clang also
+        # adds one at the end for lastprivate, even with nowait. For a
+        # "parallel for", make the variable private to the parallel region and
+        # copy it by hand: in from a snapshot taken before the region, when
+        # each thread starts, and out to a temp that the thread running the
+        # last iteration sets, copied back after the region. The copy-in and
+        # the copy-out then touch different variables, and no clause is left
+        # to add a barrier.
+        #
+        # With a static schedule (made explicit if none is given), each thread
+        # runs its iterations in increasing order. So a thread ran the last
+        # iteration if the last one it ran is the last, and it can copy out
+        # after its loop, which keeps the loop vectorizable. Other schedules
+        # may run chunks out of order, so they check every iteration.
+        #
+        # In a parallel() block, code of the block before and after the loop
+        # may read the variable, so it keeps firstprivate and lastprivate.
+        snapshots = {}
+        copy_outs = {}
+        copy_out_after_loop = self.schedule in (None, 'static')
+        for entry in self.vars_copied_by_hand():
+            temp = code.funcstate.allocate_temp(entry.type, manage_ref=False)
+            code.globalstate.use_utility_code(parallel_snapshot_utility_code)
+            code.putln("__Pyx_ParallelSnapshot(&%s, &%s, sizeof(%s));" % (
+                temp, entry.cname, temp))
+            snapshots[entry] = temp
+            copy_outs[entry] = code.funcstate.allocate_temp(entry.type, manage_ref=False)
+
         if self.is_nested_prange:
             code.putln("#if 0")
         else:
@@ -11080,8 +11169,15 @@ class ParallelRangeNode(ParallelStatNode):
 
             code.begin_block()  # pragma omp parallel begin block
 
+            if copy_outs and copy_out_after_loop:
+                code.putln("%s %s = -1;" % (
+                    self.index_type.empty_declaration_code(), Naming.parallel_last_index))
+
             # Initialize the GIL if needed for this thread
             self.begin_parallel_block(code)
+
+            for entry, temp in snapshots.items():
+                code.putln("%s = %s;" % (entry.cname, temp))
 
             if self.is_nested_prange:
                 code.putln("#if 0")
@@ -11109,10 +11205,13 @@ class ParallelRangeNode(ParallelStatNode):
                     # This is the only way reductions + nesting works in gcc4.5
                     reduction_codepoint.put(
                                 " reduction(%s:%s)" % (op, entry.cname))
-            else:
-                if not entry.type.is_pyobject:
-                    code.put(" firstprivate(%s)" % entry.cname)
-                    code.put(" lastprivate(%s)" % entry.cname)
+            elif entry in snapshots:
+                reduction_codepoint.put(" private(%s)" % entry.cname)
+            elif self.is_nested_prange:
+                pass  # not parallelized, its pragma is in "#if 0"
+            elif not entry.type.is_pyobject:
+                code.put(" firstprivate(%s)" % entry.cname)
+                code.put(" lastprivate(%s)" % entry.cname)
 
         if self.schedule:
             if self.chunksize:
@@ -11121,6 +11220,11 @@ class ParallelRangeNode(ParallelStatNode):
                 chunksize = ""
 
             code.put(" schedule(%s%s)" % (self.schedule, chunksize))
+        elif copy_outs and copy_out_after_loop:
+            # Without a schedule clause, the schedule is up to the compiler.
+            # Only an explicit static schedule guarantees that each thread
+            # runs its iterations in increasing order.
+            code.put(" schedule(static)")
 
         self.put_num_threads(reduction_codepoint)
 
@@ -11162,7 +11266,18 @@ class ParallelRangeNode(ParallelStatNode):
             guard_around_body_codepoint.putln("if (%s < 2)" % Naming.parallel_why)
 
         code.end_block()  # end guard around loop body
+
+        if copy_outs and copy_out_after_loop:
+            code.putln("%s = %s;" % (Naming.parallel_last_index, fmt_dict['i']))
+        elif copy_outs:
+            code.putln("if (%s == %s - 1)" % (fmt_dict['i'], fmt_dict['nsteps']))
+            self.put_copy_outs(code, copy_outs)
+
         code.end_block()  # end for loop block
+
+        if copy_outs and copy_out_after_loop:
+            code.putln("if (%s == %s - 1)" % (Naming.parallel_last_index, fmt_dict['nsteps']))
+            self.put_copy_outs(code, copy_outs)
 
         if self.acquire_gil:
             code.putln("#ifdef _OPENMP")
@@ -11186,6 +11301,11 @@ class ParallelRangeNode(ParallelStatNode):
             # Release the GIL and deallocate the thread state
             self.end_parallel_block(code)
             code.end_block()  # pragma omp parallel end block
+
+        for entry, temp in copy_outs.items():
+            code.putln("%s = %s;" % (entry.cname, temp))
+        for temp in list(snapshots.values()) + list(copy_outs.values()):
+            code.funcstate.release_temp(temp)
 
 
 class CnameDecoratorNode(StatNode):
